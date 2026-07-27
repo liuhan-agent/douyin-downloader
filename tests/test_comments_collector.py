@@ -287,6 +287,50 @@ async def test_collector_uses_browser_fallback_after_reply_api_failure(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_browser_fallback_preserves_reply_media_fields(tmp_path):
+    class _ReplyFailure(RuntimeError):
+        error_code = "reply_response_invalid"
+
+    api = _ReplyAPIClient(reply_error=_ReplyFailure("invalid"))
+
+    async def _fallback(*_args):
+        return {
+            "replies": [
+                {
+                    "cid": "reply-image",
+                    "text": "",
+                    "parent_comment_id": "root-1",
+                    "media_types": ["image"],
+                },
+                {
+                    "cid": "reply-sticker",
+                    "text": "",
+                    "parent_comment_id": "root-1",
+                    "sticker": {"uri": "private-sticker-id"},
+                },
+            ]
+        }
+
+    collector = CommentsCollector(
+        api,
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+        reply_browser_fallback=_fallback,
+    )
+    payload = await collector.collect_and_save("A1", tmp_path / "out.json")
+
+    replies = {
+        item["cid"]: item
+        for item in payload["comments"]
+        if item["parent_comment_id"]
+    }
+    assert replies["reply-image"]["media_types"] == ["image"]
+    assert replies["reply-sticker"]["sticker"] == {"uri": "private-sticker-id"}
+
+
+@pytest.mark.asyncio
 async def test_collector_keeps_top_level_when_reply_fallback_fails(tmp_path):
     class _ReplyFailure(RuntimeError):
         error_code = "reply_login_required"
