@@ -48,6 +48,32 @@ class _ReplyAPIClient:
         return self.reply_page
 
 
+class _EmbeddedReplyAPIClient(_ReplyAPIClient):
+    def __init__(self, reply_total=1):
+        super().__init__()
+        self.reply_total = reply_total
+
+    async def get_aweme_comments(self, aweme_id, *, cursor, count, include_replies):
+        assert include_replies is False
+        return {
+            "items": [
+                {
+                    "cid": "root-1",
+                    "text": "root",
+                    "reply_comment_total": self.reply_total,
+                    "reply_comment": [
+                        {
+                            "cid": "reply-embedded",
+                            "text": "embedded reply",
+                        }
+                    ],
+                }
+            ],
+            "has_more": False,
+            "max_cursor": 0,
+        }
+
+
 @pytest.mark.asyncio
 async def test_collector_paginates_until_no_more(tmp_path):
     api = _FakeAPIClient(
@@ -172,6 +198,52 @@ async def test_collector_flattens_api_replies_with_parent_id(tmp_path):
     assert payload["comments"][1]["parent_comment_id"] == "root-1"
     assert payload["reply_api_attempted"] == 1
     assert payload["reply_browser_fallback_attempted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_collector_uses_embedded_replies_without_second_request(tmp_path):
+    api = _EmbeddedReplyAPIClient()
+    collector = CommentsCollector(
+        api,
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+    )
+
+    payload = await collector.collect_and_save("A1", tmp_path / "out.json")
+
+    assert payload is not None
+    assert [item["cid"] for item in payload["comments"]] == [
+        "root-1",
+        "reply-embedded",
+    ]
+    assert payload["comments"][1]["parent_comment_id"] == "root-1"
+    assert api.reply_calls == []
+    assert payload["reply_api_attempted"] == 0
+    assert payload["reply_browser_fallback_attempted"] == 0
+
+
+@pytest.mark.asyncio
+async def test_embedded_replies_report_configured_truncation(tmp_path):
+    api = _EmbeddedReplyAPIClient(reply_total=2)
+    collector = CommentsCollector(
+        api,
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=1,
+        max_replies_per_content=200,
+    )
+
+    payload = await collector.collect_and_save("A1", tmp_path / "out.json")
+
+    assert payload is not None
+    assert [item["cid"] for item in payload["comments"]] == [
+        "root-1",
+        "reply-embedded",
+    ]
+    assert payload["replies_truncated"] is True
+    assert api.reply_calls == []
 
 
 @pytest.mark.asyncio

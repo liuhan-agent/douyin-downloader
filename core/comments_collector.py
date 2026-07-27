@@ -42,6 +42,13 @@ def _reply_total(comment: Dict[str, Any]) -> int:
         return 0
 
 
+def _embedded_replies(comment: Dict[str, Any]) -> List[Dict[str, Any]]:
+    values = comment.get("reply_comment")
+    if not isinstance(values, list):
+        return []
+    return [item for item in values if isinstance(item, dict)]
+
+
 def _normalize_comment(
     comment: Dict[str, Any], *, parent_comment_id: str = ""
 ) -> Dict[str, Any]:
@@ -216,13 +223,39 @@ class CommentsCollector:
         content_reply_count = 0
         metrics = self._last_reply_metrics
 
-        for comment in comments:
+        for comment in list(comments):
             if content_reply_count >= self.max_replies_per_content:
                 if _reply_total(comment) > 0:
                     metrics["replies_truncated"] = True
                 continue
             parent_id = _comment_id(comment)
             if not parent_id or _reply_total(comment) <= 0:
+                continue
+
+            reply_total = _reply_total(comment)
+            content_remaining = (
+                self.max_replies_per_content - content_reply_count
+            )
+            parent_target = min(
+                reply_total,
+                self.max_replies_per_comment,
+                content_remaining,
+            )
+            if reply_total > parent_target:
+                metrics["replies_truncated"] = True
+            embedded = _embedded_replies(comment)[
+                :parent_target
+            ]
+            embedded_added = self._append_replies(
+                comments,
+                embedded,
+                parent_id,
+            )
+            content_reply_count += embedded_added
+            if embedded_added >= parent_target:
+                continue
+            if content_reply_count >= self.max_replies_per_content:
+                metrics["replies_truncated"] = True
                 continue
 
             metrics["reply_api_attempted"] += 1
@@ -244,8 +277,14 @@ class CommentsCollector:
                 )
             else:
                 metrics["reply_api_succeeded"] += 1
+            parent_remaining = max(
+                0,
+                self.max_replies_per_comment - embedded_added,
+            )
             content_reply_count += self._append_replies(
-                comments, replies, parent_id
+                comments,
+                replies[:parent_remaining],
+                parent_id,
             )
 
         if not failed:
