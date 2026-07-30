@@ -318,6 +318,15 @@ comments:
 
 Generates a `{date}_{title}_{aweme_id}_comments.json` next to the media file.
 
+Top-level comment pages are written atomically after each valid page. An
+incomplete checkpoint contains `collection_complete: false`,
+`top_level_pages_collected`, and `resume_cursor`; callers may renew the HTTP
+session and resume the same aweme from that cursor. The final write sets
+`collection_complete: true`. Checkpoints are bounded, tied to the expected
+aweme ID, and deduplicated by comment ID. Login or verification remains a
+manual condition and is never bypassed. Request URLs, response bodies,
+cookies, tokens, and exception text are not added to checkpoint metadata.
+
 ### Dump the hot search board
 
 ```bash

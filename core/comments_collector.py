@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
@@ -19,6 +20,14 @@ ReplyBrowserFallback = Callable[
     [str, Optional[str], List[Dict[str, Any]], int, int],
     Awaitable[Dict[str, Any]],
 ]
+PageCheckpointCallback = Callable[
+    [List[Dict[str, Any]], int, int],
+    Awaitable[None],
+]
+
+_MAX_CHECKPOINT_PAGES = 10_000
+_MAX_CHECKPOINT_COMMENTS = 100_000
+_MAX_CHECKPOINT_CURSOR = (1 << 63) - 1
 
 _SAFE_REPLY_ERROR_CODES = {
     "reply_api_failed",
@@ -29,6 +38,55 @@ _SAFE_REPLY_ERROR_CODES = {
     "reply_comment_not_found",
     "reply_browser_failed",
 }
+
+
+class CommentCheckpointError(RuntimeError):
+    """Fixed safe error raised when an atomic checkpoint cannot be written."""
+
+    error_code = "comment_checkpoint_invalid"
+
+    def __init__(self):
+        super().__init__(self.error_code)
+
+
+@dataclass(frozen=True)
+class CommentCheckpoint:
+    aweme_id: str
+    comments: Tuple[Dict[str, Any], ...]
+    pages_collected: int
+    resume_cursor: int
+
+
+def _bounded_int(value: Any, *, maximum: int) -> Optional[int]:
+    try:
+        normalized = int(value)
+    except (TypeError, ValueError):
+        return None
+    if normalized < 0 or normalized > maximum:
+        return None
+    return normalized
+
+
+def _checkpoint_payload(
+    aweme_id: str,
+    comments: List[Dict[str, Any]],
+    *,
+    include_replies: bool,
+    pages_collected: int,
+    resume_cursor: int,
+    complete: bool,
+    reply_metrics: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    return {
+        "aweme_id": aweme_id,
+        "count": len(comments),
+        "include_replies": include_replies,
+        "comments": comments,
+        "collection_complete": bool(complete),
+        "top_level_pages_collected": max(0, int(pages_collected)),
+        "resume_cursor": max(0, int(resume_cursor)),
+        **(reply_metrics or {}),
+    }
 
 
 def _comment_id(comment: Dict[str, Any]) -> str:
@@ -92,6 +150,8 @@ class CommentsCollector:
         self.content_url_resolver = content_url_resolver
         self._content_urls: Dict[str, str] = {}
         self._last_reply_metrics: Dict[str, Any] = {}
+        self._last_top_level_pages_collected = 0
+        self._last_top_level_cursor = 0
 
     def set_content_url(self, aweme_id: str, content_url: str) -> None:
         """Attach a safe detail-page URL for a later browser fallback."""
@@ -110,29 +170,141 @@ class CommentsCollector:
         return str(value) if value else None
 
     async def collect_and_save(
-        self, aweme_id: str, output_path: Path
+        self,
+        aweme_id: str,
+        output_path: Path,
+        *,
+        resume: bool = False,
     ) -> Optional[Dict[str, Any]]:
-        comments = await self.collect(aweme_id)
+        checkpoint = (
+            await self.load_checkpoint(aweme_id, output_path)
+            if resume
+            else None
+        )
+
+        async def save_page(
+            comments: List[Dict[str, Any]],
+            pages_collected: int,
+            resume_cursor: int,
+        ) -> None:
+            saved = await self.metadata_handler.save_metadata(
+                _checkpoint_payload(
+                    aweme_id,
+                    comments,
+                    include_replies=self.include_replies,
+                    pages_collected=pages_collected,
+                    resume_cursor=resume_cursor,
+                    complete=False,
+                ),
+                output_path,
+            )
+            if not saved:
+                raise CommentCheckpointError
+
+        comments = await self.collect(
+            aweme_id,
+            initial_comments=(
+                [dict(item) for item in checkpoint.comments]
+                if checkpoint
+                else None
+            ),
+            initial_cursor=checkpoint.resume_cursor if checkpoint else 0,
+            initial_page_count=checkpoint.pages_collected if checkpoint else 0,
+            page_callback=save_page,
+        )
         if comments is None:
             return None
 
-        payload = {
-            "aweme_id": aweme_id,
-            "count": len(comments),
-            "include_replies": self.include_replies,
-            "comments": comments,
-            **self._last_reply_metrics,
-        }
+        payload = _checkpoint_payload(
+            aweme_id,
+            comments,
+            include_replies=self.include_replies,
+            pages_collected=self._last_top_level_pages_collected,
+            resume_cursor=self._last_top_level_cursor,
+            complete=True,
+            reply_metrics=self._last_reply_metrics,
+        )
         saved = await self.metadata_handler.save_metadata(payload, output_path)
         if not saved:
             logger.warning("Failed to save comments for %s to %s", aweme_id, output_path)
             return None
         return payload
 
-    async def collect(self, aweme_id: str) -> Optional[List[Dict[str, Any]]]:
-        all_comments: List[Dict[str, Any]] = []
-        seen_ids: set[str] = set()
-        cursor = 0
+    async def load_checkpoint(
+        self, aweme_id: str, output_path: Path
+    ) -> Optional[CommentCheckpoint]:
+        if not output_path.is_file():
+            return None
+        raw = await self.metadata_handler.load_metadata(output_path)
+        if not isinstance(raw, dict):
+            return None
+        if str(raw.get("aweme_id") or "") != str(aweme_id):
+            return None
+        if raw.get("collection_complete") is not False:
+            return None
+        comments = raw.get("comments")
+        if not isinstance(comments, list):
+            return None
+        comment_limit = (
+            min(self.max_comments, _MAX_CHECKPOINT_COMMENTS)
+            if self.max_comments > 0
+            else _MAX_CHECKPOINT_COMMENTS
+        )
+        if len(comments) > comment_limit or not all(
+            isinstance(item, dict) for item in comments
+        ):
+            return None
+        pages_collected = _bounded_int(
+            raw.get("top_level_pages_collected"),
+            maximum=_MAX_CHECKPOINT_PAGES,
+        )
+        resume_cursor = _bounded_int(
+            raw.get("resume_cursor"),
+            maximum=_MAX_CHECKPOINT_CURSOR,
+        )
+        if pages_collected is None or resume_cursor is None:
+            return None
+        return CommentCheckpoint(
+            aweme_id=str(aweme_id),
+            comments=tuple(dict(item) for item in comments),
+            pages_collected=pages_collected,
+            resume_cursor=resume_cursor,
+        )
+
+    async def load_partial_payload(
+        self, aweme_id: str, output_path: Path
+    ) -> Optional[Dict[str, Any]]:
+        checkpoint = await self.load_checkpoint(aweme_id, output_path)
+        if checkpoint is None or not checkpoint.comments:
+            return None
+        return _checkpoint_payload(
+            aweme_id,
+            [dict(item) for item in checkpoint.comments],
+            include_replies=self.include_replies,
+            pages_collected=checkpoint.pages_collected,
+            resume_cursor=checkpoint.resume_cursor,
+            complete=False,
+            reply_metrics=self._empty_reply_metrics(),
+        )
+
+    async def renew_http_session(self) -> None:
+        await self.api_client.renew_session()
+
+    async def collect(
+        self,
+        aweme_id: str,
+        *,
+        initial_comments: Optional[List[Dict[str, Any]]] = None,
+        initial_cursor: int = 0,
+        initial_page_count: int = 0,
+        page_callback: Optional[PageCheckpointCallback] = None,
+    ) -> Optional[List[Dict[str, Any]]]:
+        all_comments = [dict(item) for item in (initial_comments or [])]
+        seen_ids = {
+            _comment_id(item) for item in all_comments if _comment_id(item)
+        }
+        cursor = max(0, int(initial_cursor))
+        pages_collected = max(0, int(initial_page_count))
 
         while True:
             try:
@@ -144,12 +316,16 @@ class CommentsCollector:
                     # failures can be handed to the browser fallback.
                     include_replies=False,
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:  # noqa: BLE001
+                if str(getattr(exc, "error_code", "")).startswith("comment_"):
+                    raise
                 logger.warning(
-                    "Comments fetch error for %s cursor=%s: %s",
+                    "Comments fetch error for %s cursor=%s error_type=%s",
                     aweme_id,
                     cursor,
-                    exc,
+                    type(exc).__name__,
                 )
                 return None
 
@@ -158,8 +334,6 @@ class CommentsCollector:
             items = page.get("items") or []
             if not isinstance(items, list):
                 return None
-            if not items:
-                break
 
             for item in items:
                 if not isinstance(item, dict):
@@ -175,11 +349,27 @@ class CommentsCollector:
                     all_comments = all_comments[: self.max_comments]
                     break
 
+            try:
+                next_cursor = int(page.get("max_cursor") or cursor)
+            except (TypeError, ValueError):
+                next_cursor = cursor
+            pages_collected += 1
+            if page_callback is not None:
+                await page_callback(
+                    [dict(item) for item in all_comments],
+                    pages_collected,
+                    max(0, next_cursor),
+                )
+
+            if not items:
+                cursor = max(0, next_cursor)
+                break
             if 0 < self.max_comments <= len(all_comments):
+                cursor = max(0, next_cursor)
                 break
             if not page.get("has_more"):
+                cursor = max(0, next_cursor)
                 break
-            next_cursor = page.get("max_cursor") or 0
             if next_cursor == cursor:
                 logger.warning(
                     "Comments cursor stuck (aweme=%s, cursor=%s); stopping.",
@@ -187,9 +377,11 @@ class CommentsCollector:
                     cursor,
                 )
                 break
-            cursor = next_cursor
+            cursor = max(0, next_cursor)
             await asyncio.sleep(self.retry_delay_seconds * 0.1)
 
+        self._last_top_level_pages_collected = pages_collected
+        self._last_top_level_cursor = cursor
         self._last_reply_metrics = self._empty_reply_metrics()
         if self._replies_enabled():
             await self._collect_replies(aweme_id, all_comments)

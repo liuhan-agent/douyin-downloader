@@ -51,6 +51,61 @@ class ReplyAPIError(RuntimeError):
         super().__init__(f"{self.error_code}{detail}")
 
 
+_SAFE_COMMENT_REQUEST_ERRORS = frozenset(
+    {
+        "comment_page_timeout",
+        "comment_empty_response",
+        "comment_http_failure",
+    }
+)
+
+
+class APIRequestExhaustedError(RuntimeError):
+    """Fixed, sanitized classification for an exhausted JSON request."""
+
+    def __init__(self, error_code: str, attempt_count: int):
+        if error_code not in _SAFE_COMMENT_REQUEST_ERRORS:
+            error_code = "comment_http_failure"
+        self.error_code = error_code
+        self.attempt_count = max(1, int(attempt_count))
+        super().__init__(error_code)
+
+
+_SAFE_COMMENT_PAGE_ERRORS = frozenset(
+    {
+        "comment_page_timeout",
+        "comment_empty_response",
+        "comment_http_failure",
+        "comment_login_required",
+        "comment_verification_required",
+        "comment_response_invalid",
+    }
+)
+
+
+class CommentPageError(RuntimeError):
+    """Fixed, sanitized classification for an invalid top-level comment page."""
+
+    def __init__(self, error_code: str, attempt_count: int = 0):
+        self.error_code = (
+            error_code
+            if error_code in _SAFE_COMMENT_PAGE_ERRORS
+            else "comment_http_failure"
+        )
+        self.attempt_count = max(0, int(attempt_count))
+        super().__init__(self.error_code)
+
+
+def _safe_request_error_code(
+    last_exc: Optional[BaseException], saw_empty_response: bool
+) -> str:
+    if isinstance(last_exc, (asyncio.TimeoutError, TimeoutError)):
+        return "comment_page_timeout"
+    if saw_empty_response:
+        return "comment_empty_response"
+    return "comment_http_failure"
+
+
 def _is_login_required(data: object) -> bool:
     if not isinstance(data, dict):
         return False
@@ -112,6 +167,8 @@ def _log_api_response(
     body: bytes,
     data: object,
     started: float,
+    *,
+    redact_values: bool = False,
 ) -> None:
     summary = _summarize_api_response(data)
     logger.info(
@@ -124,7 +181,7 @@ def _log_api_response(
         _elapsed_ms(started),
         len(body),
         summary["api_status"],
-        summary["status_msg"],
+        "" if redact_values else summary["status_msg"],
         summary["item_key"],
         summary["item_count"],
         summary["has_more"],
@@ -231,6 +288,12 @@ class DouyinAPIClient:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def renew_session(self) -> None:
+        """Drop stale transport state while retaining sanitized auth material."""
+
+        await self.close()
+        self._session = None
+
     async def get_session(self) -> aiohttp.ClientSession:
         await self._ensure_session()
         if self._session is None:
@@ -327,10 +390,12 @@ class DouyinAPIClient:
         max_retries: int = 3,
         base_url: Optional[str] = None,
         request_headers: Optional[Dict[str, str]] = None,
+        raise_on_exhausted: bool = False,
     ) -> Dict[str, Any]:
         await self._ensure_session()
         delays = [1, 2, 5]
         last_exc: Optional[Exception] = None
+        saw_empty_response = False
 
         for attempt in range(max_retries):
             started = time.monotonic()
@@ -374,6 +439,7 @@ class DouyinAPIClient:
                                 retry_status,
                             )
                             last_exc = RuntimeError(f"Empty 200 response for {path} (anti-bot)")
+                            saw_empty_response = True
                             if attempt < max_retries - 1:
                                 delay = delays[min(attempt, len(delays) - 1)]
                                 await asyncio.sleep(delay)
@@ -394,7 +460,15 @@ class DouyinAPIClient:
                                 )
                                 return {}
                         result = data if isinstance(data, dict) else {}
-                        _log_api_response(path, attempt, max_retries, body, result, started)
+                        _log_api_response(
+                            path,
+                            attempt,
+                            max_retries,
+                            body,
+                            result,
+                            started,
+                            redact_values=raise_on_exhausted,
+                        )
                         if _is_login_required(result):
                             raise LoginRequiredError(
                                 int(result.get("status_code") or 0),
@@ -414,6 +488,10 @@ class DouyinAPIClient:
                             _elapsed_ms(started),
                             suppress_error,
                         )
+                        if raise_on_exhausted:
+                            raise APIRequestExhaustedError(
+                                "comment_http_failure", attempt + 1
+                            )
                         return {}
                     last_exc = RuntimeError(f"HTTP {response.status} for {path}")
                     logger.warning(
@@ -425,7 +503,7 @@ class DouyinAPIClient:
                         response.status,
                         _elapsed_ms(started),
                     )
-            except LoginRequiredError:
+            except (LoginRequiredError, APIRequestExhaustedError):
                 raise
             except Exception as exc:
                 last_exc = exc
@@ -437,7 +515,11 @@ class DouyinAPIClient:
                     max_retries,
                     _elapsed_ms(started),
                     type(exc).__name__,
-                    _safe_error_text(exc),
+                    (
+                        _safe_request_error_code(exc, saw_empty_response)
+                        if raise_on_exhausted
+                        else _safe_error_text(exc)
+                    ),
                 )
 
             if attempt < max_retries - 1:
@@ -459,8 +541,17 @@ class DouyinAPIClient:
             max_retries,
             suppress_error,
             type(last_exc).__name__ if last_exc else "-",
-            _safe_error_text(last_exc) if last_exc else "-",
+            (
+                _safe_request_error_code(last_exc, saw_empty_response)
+                if raise_on_exhausted
+                else (_safe_error_text(last_exc) if last_exc else "-")
+            ),
         )
+        if raise_on_exhausted:
+            raise APIRequestExhaustedError(
+                _safe_request_error_code(last_exc, saw_empty_response),
+                max_retries,
+            )
         return {}
 
     @staticmethod
@@ -1106,7 +1197,32 @@ class DouyinAPIClient:
                 "rcFT": "",
             }
         )
-        raw = await self._request_json("/aweme/v1/web/comment/list/", params)
+        try:
+            raw = await self._request_json(
+                "/aweme/v1/web/comment/list/",
+                params,
+                raise_on_exhausted=True,
+            )
+        except LoginRequiredError as exc:
+            raise CommentPageError("comment_login_required") from exc
+        except APIRequestExhaustedError as exc:
+            raise CommentPageError(exc.error_code, exc.attempt_count) from exc
+
+        if not raw:
+            raise CommentPageError("comment_empty_response")
+        if _reply_login_required(raw):
+            raise CommentPageError("comment_login_required")
+        if _is_verification_required(raw):
+            raise CommentPageError("comment_verification_required")
+        try:
+            status_code = int(raw.get("status_code", -1))
+        except (TypeError, ValueError):
+            raise CommentPageError("comment_response_invalid") from None
+        if status_code != 0:
+            raise CommentPageError("comment_http_failure")
+        if not isinstance(raw.get("comments"), list):
+            raise CommentPageError("comment_response_invalid")
+
         normalized = self._normalize_paged_response(raw, item_keys=["comments"])
 
         if include_replies:
