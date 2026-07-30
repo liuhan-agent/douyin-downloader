@@ -1,5 +1,6 @@
 """CommentsCollector 测试。"""
 
+import asyncio
 import json
 from typing import Any, Dict, List
 
@@ -19,6 +20,155 @@ class _FakeAPIClient:
         if not self._pages:
             return {"items": [], "has_more": False, "max_cursor": cursor}
         return self._pages.pop(0)
+
+
+class _RecordingMetadataHandler(MetadataHandler):
+    def __init__(self):
+        super().__init__()
+        self.writes = []
+
+    async def save_metadata(self, data, save_path):
+        self.writes.append(json.loads(json.dumps(data)))
+        return await super().save_metadata(data, save_path)
+
+
+class _TwoPageAPI:
+    def __init__(self):
+        self.cursors = []
+
+    async def get_aweme_comments(
+        self, aweme_id, *, cursor, count, include_replies
+    ):
+        self.cursors.append(cursor)
+        if cursor == 0:
+            return {
+                "items": [{"cid": "C1", "text": "one"}],
+                "has_more": True,
+                "max_cursor": 20,
+            }
+        return {
+            "items": [{"cid": "C2", "text": "two"}],
+            "has_more": False,
+            "max_cursor": 20,
+        }
+
+
+@pytest.mark.asyncio
+async def test_collect_and_save_checkpoints_every_top_level_page(tmp_path):
+    handler = _RecordingMetadataHandler()
+    collector = CommentsCollector(
+        _TwoPageAPI(), handler, retry_delay_seconds=0
+    )
+
+    payload = await collector.collect_and_save("A1", tmp_path / "A1.json")
+
+    assert payload is not None
+    assert [item["collection_complete"] for item in handler.writes] == [
+        False,
+        False,
+        True,
+    ]
+    assert handler.writes[0]["resume_cursor"] == 20
+    assert handler.writes[-1]["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_cancelled_collection_retains_first_page_checkpoint(tmp_path):
+    class _BlockingSecondPageAPI(_TwoPageAPI):
+        async def get_aweme_comments(
+            self, aweme_id, *, cursor, count, include_replies
+        ):
+            if cursor:
+                await asyncio.Event().wait()
+            return await super().get_aweme_comments(
+                aweme_id,
+                cursor=cursor,
+                count=count,
+                include_replies=include_replies,
+            )
+
+    output = tmp_path / "A1.json"
+    collector = CommentsCollector(
+        _BlockingSecondPageAPI(),
+        MetadataHandler(),
+        retry_delay_seconds=0,
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(
+            collector.collect_and_save("A1", output),
+            timeout=0.05,
+        )
+
+    saved = json.loads(output.read_text(encoding="utf-8"))
+    assert saved["collection_complete"] is False
+    assert saved["resume_cursor"] == 20
+    assert [item["cid"] for item in saved["comments"]] == ["C1"]
+
+
+@pytest.mark.asyncio
+async def test_collect_and_save_resumes_and_deduplicates_checkpoint(tmp_path):
+    class _ResumeAPI:
+        def __init__(self):
+            self.cursors = []
+
+        async def get_aweme_comments(
+            self, aweme_id, *, cursor, count, include_replies
+        ):
+            self.cursors.append(cursor)
+            return {
+                "items": [{"cid": "C1"}, {"cid": "C2"}],
+                "has_more": False,
+                "max_cursor": cursor,
+            }
+
+    output = tmp_path / "A1.json"
+    await MetadataHandler().save_metadata(
+        {
+            "aweme_id": "A1",
+            "count": 1,
+            "include_replies": False,
+            "comments": [{"cid": "C1", "parent_comment_id": ""}],
+            "collection_complete": False,
+            "top_level_pages_collected": 1,
+            "resume_cursor": 20,
+        },
+        output,
+    )
+    api = _ResumeAPI()
+    collector = CommentsCollector(api, MetadataHandler())
+
+    payload = await collector.collect_and_save("A1", output, resume=True)
+
+    assert api.cursors == [20]
+    assert [item["cid"] for item in payload["comments"]] == ["C1", "C2"]
+    assert payload["collection_complete"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "checkpoint",
+    [
+        {"aweme_id": "OTHER", "comments": [], "resume_cursor": 20},
+        {
+            "aweme_id": "A1",
+            "comments": "not-a-list",
+            "resume_cursor": 20,
+        },
+    ],
+)
+async def test_invalid_or_mismatched_checkpoint_starts_from_zero(
+    tmp_path, checkpoint
+):
+    output = tmp_path / "A1.json"
+    output.write_text(json.dumps(checkpoint), encoding="utf-8")
+    api = _TwoPageAPI()
+    collector = CommentsCollector(api, MetadataHandler(), retry_delay_seconds=0)
+
+    payload = await collector.collect_and_save("A1", output, resume=True)
+
+    assert api.cursors[0] == 0
+    assert payload["collection_complete"] is True
 
 
 class _ReplyAPIClient:
