@@ -5,7 +5,12 @@ import types
 
 import pytest
 
-from core.api_client import DouyinAPIClient, ReplyAPIError
+from core.api_client import (
+    APIRequestExhaustedError,
+    CommentPageError,
+    DouyinAPIClient,
+    ReplyAPIError,
+)
 
 
 def test_default_query_uses_existing_ms_token():
@@ -608,6 +613,131 @@ class _FakeSession:
 
     async def close(self):
         self.closed = True
+
+
+class _EmptyJSONResponse:
+    status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def read(self):
+        return b""
+
+
+class _EmptyJSONSession:
+    closed = False
+
+    def get(self, *_args, **_kwargs):
+        return _EmptyJSONResponse()
+
+    async def close(self):
+        self.closed = True
+
+
+class _TimeoutSession:
+    closed = False
+
+    def get(self, *_args, **_kwargs):
+        raise asyncio.TimeoutError
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_request_json_strict_timeout_raises_safe_error():
+    client = DouyinAPIClient({"msToken": "token-1"})
+    client._session = _TimeoutSession()
+
+    with pytest.raises(APIRequestExhaustedError) as exc_info:
+        await client._request_json(
+            "/aweme/v1/web/comment/list/",
+            {"aweme_id": "SENTINEL-WORK"},
+            max_retries=1,
+            raise_on_exhausted=True,
+        )
+
+    assert exc_info.value.error_code == "comment_page_timeout"
+    assert exc_info.value.attempt_count == 1
+    assert "SENTINEL-WORK" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_request_json_strict_empty_response_raises_safe_error():
+    client = DouyinAPIClient({"msToken": "token-1"})
+    client._session = _EmptyJSONSession()
+
+    with pytest.raises(APIRequestExhaustedError) as exc_info:
+        await client._request_json(
+            "/aweme/v1/web/comment/list/",
+            {"aweme_id": "SENTINEL-WORK"},
+            max_retries=1,
+            raise_on_exhausted=True,
+        )
+
+    assert exc_info.value.error_code == "comment_empty_response"
+    assert exc_info.value.attempt_count == 1
+    assert "SENTINEL-WORK" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_request_json_default_exhaustion_remains_compatible():
+    client = DouyinAPIClient({"msToken": "token-1"})
+    client._session = _TimeoutSession()
+
+    assert (
+        await client._request_json(
+            "/aweme/v1/web/comment/list/",
+            {"aweme_id": "SENTINEL-WORK"},
+            max_retries=1,
+        )
+        == {}
+    )
+
+
+@pytest.mark.asyncio
+async def test_renew_session_closes_old_session_and_creates_lazily():
+    client = DouyinAPIClient({"msToken": "token-1"})
+    old_session = _EmptyJSONSession()
+    client._session = old_session
+
+    await client.renew_session()
+
+    assert old_session.closed is True
+    assert client._session is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw", "expected_code"),
+    [
+        ({}, "comment_empty_response"),
+        (
+            {"status_code": 0, "verify_ticket": "opaque", "comments": []},
+            "comment_verification_required",
+        ),
+        ({"status_code": 4, "comments": []}, "comment_http_failure"),
+        ({"status_code": 0}, "comment_response_invalid"),
+    ],
+)
+async def test_get_aweme_comments_rejects_invalid_page(
+    monkeypatch, raw, expected_code
+):
+    client = DouyinAPIClient({"msToken": "token-1"})
+
+    async def fake_request(*_args, **_kwargs):
+        return raw
+
+    monkeypatch.setattr(client, "_request_json", fake_request)
+    with pytest.raises(CommentPageError) as exc_info:
+        await client.get_aweme_comments("SENTINEL-WORK")
+
+    assert exc_info.value.error_code == expected_code
+    assert "SENTINEL-WORK" not in str(exc_info.value)
 
 
 @pytest.mark.asyncio
