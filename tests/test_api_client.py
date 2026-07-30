@@ -648,6 +648,20 @@ class _TimeoutSession:
         self.closed = True
 
 
+class _SensitiveFailureSession:
+    closed = False
+
+    def get(self, *_args, **_kwargs):
+        raise RuntimeError(
+            "https://example.invalid/?token=SENTINEL "
+            "Cookie: SENTINEL Authorization: Bearer SENTINEL "
+            "D:\\SENTINEL\\private"
+        )
+
+    async def close(self):
+        self.closed = True
+
+
 @pytest.mark.asyncio
 async def test_request_json_strict_timeout_raises_safe_error():
     client = DouyinAPIClient({"msToken": "token-1"})
@@ -697,6 +711,27 @@ async def test_request_json_default_exhaustion_remains_compatible():
         )
         == {}
     )
+
+
+@pytest.mark.asyncio
+async def test_request_json_strict_failure_does_not_log_exception_sentinels(
+    caplog, capsys
+):
+    client = DouyinAPIClient({"msToken": "token-1"})
+    client._session = _SensitiveFailureSession()
+
+    with pytest.raises(APIRequestExhaustedError):
+        await client._request_json(
+            "/aweme/v1/web/comment/list/",
+            {"aweme_id": "A1"},
+            max_retries=1,
+            raise_on_exhausted=True,
+        )
+
+    captured = capsys.readouterr()
+    assert "SENTINEL" not in caplog.text
+    assert "SENTINEL" not in captured.out
+    assert "SENTINEL" not in captured.err
 
 
 @pytest.mark.asyncio

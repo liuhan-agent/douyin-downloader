@@ -322,10 +322,10 @@ class CommentsCollector:
                 if str(getattr(exc, "error_code", "")).startswith("comment_"):
                     raise
                 logger.warning(
-                    "Comments fetch error for %s cursor=%s: %s",
+                    "Comments fetch error for %s cursor=%s error_type=%s",
                     aweme_id,
                     cursor,
-                    exc,
+                    type(exc).__name__,
                 )
                 return None
 
