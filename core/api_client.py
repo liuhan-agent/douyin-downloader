@@ -167,6 +167,8 @@ def _log_api_response(
     body: bytes,
     data: object,
     started: float,
+    *,
+    redact_values: bool = False,
 ) -> None:
     summary = _summarize_api_response(data)
     logger.info(
@@ -179,7 +181,7 @@ def _log_api_response(
         _elapsed_ms(started),
         len(body),
         summary["api_status"],
-        summary["status_msg"],
+        "" if redact_values else summary["status_msg"],
         summary["item_key"],
         summary["item_count"],
         summary["has_more"],
@@ -458,7 +460,15 @@ class DouyinAPIClient:
                                 )
                                 return {}
                         result = data if isinstance(data, dict) else {}
-                        _log_api_response(path, attempt, max_retries, body, result, started)
+                        _log_api_response(
+                            path,
+                            attempt,
+                            max_retries,
+                            body,
+                            result,
+                            started,
+                            redact_values=raise_on_exhausted,
+                        )
                         if _is_login_required(result):
                             raise LoginRequiredError(
                                 int(result.get("status_code") or 0),
@@ -505,7 +515,11 @@ class DouyinAPIClient:
                     max_retries,
                     _elapsed_ms(started),
                     type(exc).__name__,
-                    _safe_error_text(exc),
+                    (
+                        _safe_request_error_code(exc, saw_empty_response)
+                        if raise_on_exhausted
+                        else _safe_error_text(exc)
+                    ),
                 )
 
             if attempt < max_retries - 1:
@@ -527,7 +541,11 @@ class DouyinAPIClient:
             max_retries,
             suppress_error,
             type(last_exc).__name__ if last_exc else "-",
-            _safe_error_text(last_exc) if last_exc else "-",
+            (
+                _safe_request_error_code(last_exc, saw_empty_response)
+                if raise_on_exhausted
+                else (_safe_error_text(last_exc) if last_exc else "-")
+            ),
         )
         if raise_on_exhausted:
             raise APIRequestExhaustedError(
