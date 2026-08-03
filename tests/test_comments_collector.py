@@ -146,6 +146,36 @@ async def test_collect_and_save_resumes_and_deduplicates_checkpoint(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_resume_at_comment_limit_skips_another_top_level_request(tmp_path):
+    class _UnexpectedAPI:
+        async def get_aweme_comments(self, *args, **kwargs):
+            raise AssertionError("top-level API must not be called")
+
+    output = tmp_path / "A1.json"
+    await MetadataHandler().save_metadata(
+        {
+            "aweme_id": "A1",
+            "count": 1,
+            "include_replies": False,
+            "comments": [{"cid": "C1", "parent_comment_id": ""}],
+            "collection_complete": False,
+            "top_level_pages_collected": 5,
+            "resume_cursor": 100,
+        },
+        output,
+    )
+    collector = CommentsCollector(
+        _UnexpectedAPI(), MetadataHandler(), max_comments=1
+    )
+
+    payload = await collector.collect_and_save("A1", output, resume=True)
+
+    assert payload["collection_complete"] is True
+    assert payload["top_level_pages_collected"] == 5
+    assert [item["cid"] for item in payload["comments"]] == ["C1"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "checkpoint",
     [
@@ -351,6 +381,80 @@ async def test_collector_flattens_api_replies_with_parent_id(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reply_timeout_preserves_complete_top_level_payload(tmp_path):
+    class _BlockingReplyAPI(_ReplyAPIClient):
+        async def get_aweme_comment_replies(self, **kwargs):
+            await asyncio.Event().wait()
+
+    output = tmp_path / "A1.json"
+    collector = CommentsCollector(
+        _BlockingReplyAPI(),
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", output, attempt_timeout_seconds=0.05
+    )
+
+    assert payload["collection_complete"] is True
+    assert [item["cid"] for item in payload["comments"]] == ["root-1"]
+    assert payload["replies_truncated"] is True
+    assert payload["reply_failures"] == [{"error_code": "reply_timeout"}]
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+
+
+@pytest.mark.asyncio
+async def test_reply_timeout_preserves_replies_collected_before_timeout(tmp_path):
+    class _PartiallyBlockingReplyAPI:
+        async def get_aweme_comments(
+            self, aweme_id, *, cursor, count, include_replies
+        ):
+            return {
+                "items": [
+                    {"cid": "root-1", "reply_comment_total": 1},
+                    {"cid": "root-2", "reply_comment_total": 1},
+                ],
+                "has_more": False,
+                "max_cursor": 0,
+            }
+
+        async def get_aweme_comment_replies(
+            self, *, aweme_id, comment_id, cursor, count
+        ):
+            if comment_id == "root-1":
+                return {
+                    "items": [{"cid": "reply-1"}],
+                    "has_more": False,
+                    "max_cursor": 0,
+                }
+            await asyncio.Event().wait()
+
+    collector = CommentsCollector(
+        _PartiallyBlockingReplyAPI(),
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", tmp_path / "A1.json", attempt_timeout_seconds=0.05
+    )
+
+    assert [item["cid"] for item in payload["comments"]] == [
+        "root-1",
+        "root-2",
+        "reply-1",
+    ]
+    assert payload["comments"][-1]["parent_comment_id"] == "root-1"
+    assert payload["reply_api_succeeded"] == 1
+    assert payload["reply_failures"] == [{"error_code": "reply_timeout"}]
+
+
+@pytest.mark.asyncio
 async def test_collector_uses_embedded_replies_without_second_request(tmp_path):
     api = _EmbeddedReplyAPIClient()
     collector = CommentsCollector(
@@ -434,6 +538,39 @@ async def test_collector_uses_browser_fallback_after_reply_api_failure(tmp_path)
     assert fallback_calls[0][2][0]["error_code"] == "reply_response_invalid"
     assert payload["reply_browser_fallback_attempted"] == 1
     assert payload["reply_browser_fallback_succeeded"] == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_reply_attempt_skips_browser_fallback(tmp_path):
+    class _ReplyFailure(RuntimeError):
+        error_code = "reply_response_invalid"
+
+    api = _ReplyAPIClient(reply_error=_ReplyFailure("empty"))
+    fallback_calls = []
+
+    async def _fallback(*args):
+        fallback_calls.append(args)
+        return {"replies": [{"cid": "reply-1", "parent_comment_id": "root-1"}]}
+
+    collector = CommentsCollector(
+        api,
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+        reply_browser_fallback=_fallback,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", tmp_path / "out.json", attempt_timeout_seconds=1.0
+    )
+
+    assert fallback_calls == []
+    assert [item["cid"] for item in payload["comments"]] == ["root-1"]
+    assert payload["reply_browser_fallback_attempted"] == 0
+    assert payload["reply_failures"] == [
+        {"error_code": "reply_response_invalid"}
+    ]
 
 
 @pytest.mark.asyncio

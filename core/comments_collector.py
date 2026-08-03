@@ -175,7 +175,9 @@ class CommentsCollector:
         output_path: Path,
         *,
         resume: bool = False,
+        attempt_timeout_seconds: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
+        attempt_started_at = asyncio.get_running_loop().time()
         checkpoint = (
             await self.load_checkpoint(aweme_id, output_path)
             if resume
@@ -214,6 +216,15 @@ class CommentsCollector:
         )
         if comments is None:
             return None
+
+        self._last_reply_metrics = self._empty_reply_metrics()
+        if self._replies_enabled():
+            await self._collect_replies_with_budget(
+                aweme_id,
+                comments,
+                attempt_started_at=attempt_started_at,
+                attempt_timeout_seconds=attempt_timeout_seconds,
+            )
 
         payload = _checkpoint_payload(
             aweme_id,
@@ -306,6 +317,13 @@ class CommentsCollector:
         cursor = max(0, int(initial_cursor))
         pages_collected = max(0, int(initial_page_count))
 
+        if 0 < self.max_comments <= len(all_comments):
+            all_comments = all_comments[: self.max_comments]
+            self._last_top_level_pages_collected = pages_collected
+            self._last_top_level_cursor = cursor
+            self._last_reply_metrics = self._empty_reply_metrics()
+            return all_comments
+
         while True:
             try:
                 page = await self.api_client.get_aweme_comments(
@@ -383,8 +401,6 @@ class CommentsCollector:
         self._last_top_level_pages_collected = pages_collected
         self._last_top_level_cursor = cursor
         self._last_reply_metrics = self._empty_reply_metrics()
-        if self._replies_enabled():
-            await self._collect_replies(aweme_id, all_comments)
         return all_comments
 
     def _replies_enabled(self) -> bool:
@@ -408,8 +424,56 @@ class CommentsCollector:
             "reply_fallback_failure_counts": {},
         }
 
+    def _record_reply_timeout(self) -> None:
+        metrics = self._last_reply_metrics
+        metrics["replies_truncated"] = True
+        failures = metrics["reply_failures"]
+        if not any(
+            item.get("error_code") == "reply_timeout"
+            for item in failures
+            if isinstance(item, dict)
+        ):
+            failures.append({"error_code": "reply_timeout"})
+
+    async def _collect_replies_with_budget(
+        self,
+        aweme_id: str,
+        comments: List[Dict[str, Any]],
+        *,
+        attempt_started_at: float,
+        attempt_timeout_seconds: Optional[float],
+    ) -> None:
+        if not any(_reply_total(comment) > 0 for comment in comments):
+            return
+        if attempt_timeout_seconds is None:
+            await self._collect_replies(aweme_id, comments)
+            return
+
+        attempt_budget = float(attempt_timeout_seconds)
+        elapsed = asyncio.get_running_loop().time() - attempt_started_at
+        finalization_margin = min(1.0, max(0.01, attempt_budget * 0.2))
+        remaining = attempt_budget - elapsed - finalization_margin
+        if remaining <= 0:
+            self._record_reply_timeout()
+            return
+        try:
+            await asyncio.wait_for(
+                self._collect_replies(
+                    aweme_id,
+                    comments,
+                    allow_browser_fallback=False,
+                ),
+                timeout=remaining,
+            )
+        except asyncio.TimeoutError:
+            self._record_reply_timeout()
+
     async def _collect_replies(
-        self, aweme_id: str, comments: List[Dict[str, Any]]
+        self,
+        aweme_id: str,
+        comments: List[Dict[str, Any]],
+        *,
+        allow_browser_fallback: bool = True,
     ) -> None:
         failed: List[Dict[str, Any]] = []
         content_reply_count = 0
@@ -482,7 +546,7 @@ class CommentsCollector:
         if not failed:
             return
 
-        if self.reply_browser_fallback is None:
+        if not allow_browser_fallback or self.reply_browser_fallback is None:
             self._record_failures(failed, fallback=False)
             return
 
