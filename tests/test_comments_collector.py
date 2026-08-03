@@ -381,6 +381,80 @@ async def test_collector_flattens_api_replies_with_parent_id(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_reply_timeout_preserves_complete_top_level_payload(tmp_path):
+    class _BlockingReplyAPI(_ReplyAPIClient):
+        async def get_aweme_comment_replies(self, **kwargs):
+            await asyncio.Event().wait()
+
+    output = tmp_path / "A1.json"
+    collector = CommentsCollector(
+        _BlockingReplyAPI(),
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", output, attempt_timeout_seconds=0.05
+    )
+
+    assert payload["collection_complete"] is True
+    assert [item["cid"] for item in payload["comments"]] == ["root-1"]
+    assert payload["replies_truncated"] is True
+    assert payload["reply_failures"] == [{"error_code": "reply_timeout"}]
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+
+
+@pytest.mark.asyncio
+async def test_reply_timeout_preserves_replies_collected_before_timeout(tmp_path):
+    class _PartiallyBlockingReplyAPI:
+        async def get_aweme_comments(
+            self, aweme_id, *, cursor, count, include_replies
+        ):
+            return {
+                "items": [
+                    {"cid": "root-1", "reply_comment_total": 1},
+                    {"cid": "root-2", "reply_comment_total": 1},
+                ],
+                "has_more": False,
+                "max_cursor": 0,
+            }
+
+        async def get_aweme_comment_replies(
+            self, *, aweme_id, comment_id, cursor, count
+        ):
+            if comment_id == "root-1":
+                return {
+                    "items": [{"cid": "reply-1"}],
+                    "has_more": False,
+                    "max_cursor": 0,
+                }
+            await asyncio.Event().wait()
+
+    collector = CommentsCollector(
+        _PartiallyBlockingReplyAPI(),
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", tmp_path / "A1.json", attempt_timeout_seconds=0.05
+    )
+
+    assert [item["cid"] for item in payload["comments"]] == [
+        "root-1",
+        "root-2",
+        "reply-1",
+    ]
+    assert payload["comments"][-1]["parent_comment_id"] == "root-1"
+    assert payload["reply_api_succeeded"] == 1
+    assert payload["reply_failures"] == [{"error_code": "reply_timeout"}]
+
+
+@pytest.mark.asyncio
 async def test_collector_uses_embedded_replies_without_second_request(tmp_path):
     api = _EmbeddedReplyAPIClient()
     collector = CommentsCollector(
