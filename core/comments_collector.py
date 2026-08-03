@@ -458,14 +458,22 @@ class CommentsCollector:
             return
         try:
             await asyncio.wait_for(
-                self._collect_replies(aweme_id, comments),
+                self._collect_replies(
+                    aweme_id,
+                    comments,
+                    allow_browser_fallback=False,
+                ),
                 timeout=remaining,
             )
         except asyncio.TimeoutError:
             self._record_reply_timeout()
 
     async def _collect_replies(
-        self, aweme_id: str, comments: List[Dict[str, Any]]
+        self,
+        aweme_id: str,
+        comments: List[Dict[str, Any]],
+        *,
+        allow_browser_fallback: bool = True,
     ) -> None:
         failed: List[Dict[str, Any]] = []
         content_reply_count = 0
@@ -538,7 +546,7 @@ class CommentsCollector:
         if not failed:
             return
 
-        if self.reply_browser_fallback is None:
+        if not allow_browser_fallback or self.reply_browser_fallback is None:
             self._record_failures(failed, fallback=False)
             return
 

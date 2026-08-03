@@ -541,6 +541,39 @@ async def test_collector_uses_browser_fallback_after_reply_api_failure(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_bounded_reply_attempt_skips_browser_fallback(tmp_path):
+    class _ReplyFailure(RuntimeError):
+        error_code = "reply_response_invalid"
+
+    api = _ReplyAPIClient(reply_error=_ReplyFailure("empty"))
+    fallback_calls = []
+
+    async def _fallback(*args):
+        fallback_calls.append(args)
+        return {"replies": [{"cid": "reply-1", "parent_comment_id": "root-1"}]}
+
+    collector = CommentsCollector(
+        api,
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+        reply_browser_fallback=_fallback,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", tmp_path / "out.json", attempt_timeout_seconds=1.0
+    )
+
+    assert fallback_calls == []
+    assert [item["cid"] for item in payload["comments"]] == ["root-1"]
+    assert payload["reply_browser_fallback_attempted"] == 0
+    assert payload["reply_failures"] == [
+        {"error_code": "reply_response_invalid"}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_browser_fallback_preserves_reply_media_fields(tmp_path):
     class _ReplyFailure(RuntimeError):
         error_code = "reply_response_invalid"
