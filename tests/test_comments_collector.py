@@ -146,6 +146,36 @@ async def test_collect_and_save_resumes_and_deduplicates_checkpoint(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_resume_at_comment_limit_skips_another_top_level_request(tmp_path):
+    class _UnexpectedAPI:
+        async def get_aweme_comments(self, *args, **kwargs):
+            raise AssertionError("top-level API must not be called")
+
+    output = tmp_path / "A1.json"
+    await MetadataHandler().save_metadata(
+        {
+            "aweme_id": "A1",
+            "count": 1,
+            "include_replies": False,
+            "comments": [{"cid": "C1", "parent_comment_id": ""}],
+            "collection_complete": False,
+            "top_level_pages_collected": 5,
+            "resume_cursor": 100,
+        },
+        output,
+    )
+    collector = CommentsCollector(
+        _UnexpectedAPI(), MetadataHandler(), max_comments=1
+    )
+
+    payload = await collector.collect_and_save("A1", output, resume=True)
+
+    assert payload["collection_complete"] is True
+    assert payload["top_level_pages_collected"] == 5
+    assert [item["cid"] for item in payload["comments"]] == ["C1"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "checkpoint",
     [

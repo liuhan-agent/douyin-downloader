@@ -306,6 +306,13 @@ class CommentsCollector:
         cursor = max(0, int(initial_cursor))
         pages_collected = max(0, int(initial_page_count))
 
+        if 0 < self.max_comments <= len(all_comments):
+            all_comments = all_comments[: self.max_comments]
+            self._last_top_level_pages_collected = pages_collected
+            self._last_top_level_cursor = cursor
+            self._last_reply_metrics = self._empty_reply_metrics()
+            return all_comments
+
         while True:
             try:
                 page = await self.api_client.get_aweme_comments(
