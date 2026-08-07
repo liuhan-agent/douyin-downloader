@@ -6,8 +6,25 @@ from typing import Any, Dict, List
 
 import pytest
 
-from core.comments_collector import CommentsCollector
+from core.comments_collector import CommentsCollector, _bounded_reply_phase_budgets
 from storage.metadata_handler import MetadataHandler
+
+
+@pytest.mark.parametrize(
+    ("total_seconds", "browser_cap_seconds", "expected"),
+    [
+        (0.0, 20.0, (0.0, 0.0)),
+        (0.20, 0.08, (0.10, 0.08)),
+        (10.0, 20.0, (4.5, 4.5)),
+        (75.0, 20.0, (54.0, 20.0)),
+    ],
+)
+def test_bounded_reply_phase_budgets_reserve_fallback_and_finalization(
+    total_seconds, browser_cap_seconds, expected
+):
+    assert _bounded_reply_phase_budgets(
+        total_seconds, browser_cap_seconds
+    ) == pytest.approx(expected)
 
 
 class _FakeAPIClient:
@@ -628,6 +645,9 @@ async def test_bounded_browser_fallback_caps_and_allowlists_failed_parents(tmp_p
         error_code = "reply_response_invalid"
 
     class _FiveParentAPI:
+        def __init__(self):
+            self.reply_parent_ids = []
+
         async def get_aweme_comments(
             self, aweme_id, *, cursor, count, include_replies
         ):
@@ -640,7 +660,8 @@ async def test_bounded_browser_fallback_caps_and_allowlists_failed_parents(tmp_p
                 "max_cursor": 0,
             }
 
-        async def get_aweme_comment_replies(self, **_kwargs):
+        async def get_aweme_comment_replies(self, **kwargs):
+            self.reply_parent_ids.append(kwargs["comment_id"])
             raise _ReplyFailure("empty")
 
     fallback_calls = []
@@ -655,8 +676,9 @@ async def test_bounded_browser_fallback_caps_and_allowlists_failed_parents(tmp_p
             + [{"cid": "outside-reply", "parent_comment_id": "root-4"}]
         }
 
+    api = _FiveParentAPI()
     collector = CommentsCollector(
-        _FiveParentAPI(),
+        api,
         MetadataHandler(),
         include_replies=True,
         max_replies_per_comment=2,
@@ -676,6 +698,7 @@ async def test_bounded_browser_fallback_caps_and_allowlists_failed_parents(tmp_p
         "root-1",
         "root-2",
     ]
+    assert api.reply_parent_ids == ["root-0", "root-1", "root-2"]
     replies = [item for item in payload["comments"] if item["parent_comment_id"]]
     assert {item["cid"] for item in replies} == {"reply-0", "reply-1", "reply-2"}
     assert {item["parent_comment_id"] for item in replies} == {
@@ -683,16 +706,128 @@ async def test_bounded_browser_fallback_caps_and_allowlists_failed_parents(tmp_p
         "root-1",
         "root-2",
     }
-    assert payload["reply_api_attempted"] == 5
-    assert payload["reply_api_failed"] == 5
+    assert payload["reply_api_attempted"] == 3
+    assert payload["reply_api_failed"] == 3
     assert payload["reply_browser_fallback_attempted"] == 3
     assert payload["reply_browser_fallback_succeeded"] == 3
     assert payload["reply_browser_fallback_failed"] == 0
-    assert payload["reply_failures"] == [
-        {"error_code": "reply_response_invalid"},
-        {"error_code": "reply_response_invalid"},
-    ]
+    assert payload["reply_failures"] == []
     assert payload["replies_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_bounded_reply_phase_reserves_time_for_browser_fallback(tmp_path):
+    class _SlowReplyAPI:
+        async def get_aweme_comments(
+            self, aweme_id, *, cursor, count, include_replies
+        ):
+            return {
+                "items": [
+                    {"cid": "root-0", "reply_comment_total": 1},
+                    {"cid": "root-1", "reply_comment_total": 1},
+                ],
+                "has_more": False,
+                "max_cursor": 0,
+            }
+
+        async def get_aweme_comment_replies(self, **_kwargs):
+            await asyncio.sleep(0.12)
+            return {"comments": [], "has_more": False, "cursor": 0}
+
+    fallback_calls = []
+
+    async def _fallback(*args):
+        fallback_calls.append(args)
+        return {
+            "replies": [
+                {
+                    "cid": "reply-browser",
+                    "parent_comment_id": args[2][0]["comment_id"],
+                }
+            ]
+        }
+
+    collector = CommentsCollector(
+        _SlowReplyAPI(),
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+        reply_browser_fallback=_fallback,
+        bounded_browser_fallback_parent_limit=3,
+        bounded_browser_fallback_timeout_seconds=0.08,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", tmp_path / "out.json", attempt_timeout_seconds=0.20
+    )
+
+    assert len(fallback_calls) == 1
+    assert [item["comment_id"] for item in fallback_calls[0][2]] == ["root-0"]
+    assert [item["cid"] for item in payload["comments"]] == [
+        "root-0",
+        "root-1",
+        "reply-browser",
+    ]
+    assert payload["reply_api_attempted"] == 1
+    assert payload["reply_api_failed"] == 1
+    assert payload["reply_browser_fallback_attempted"] == 1
+    assert payload["reply_browser_fallback_succeeded"] == 1
+    assert payload["reply_failures"] == []
+    assert payload["replies_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_bounded_reply_phase_does_not_apply_fallback_cap_without_fallback(
+    tmp_path,
+):
+    class _ReplyFailure(RuntimeError):
+        error_code = "reply_response_invalid"
+
+    class _FiveParentAPI:
+        def __init__(self):
+            self.reply_parent_ids = []
+
+        async def get_aweme_comments(
+            self, aweme_id, *, cursor, count, include_replies
+        ):
+            return {
+                "items": [
+                    {"cid": f"root-{index}", "reply_comment_total": 1}
+                    for index in range(5)
+                ],
+                "has_more": False,
+                "max_cursor": 0,
+            }
+
+        async def get_aweme_comment_replies(self, **kwargs):
+            self.reply_parent_ids.append(kwargs["comment_id"])
+            raise _ReplyFailure("empty")
+
+    api = _FiveParentAPI()
+    collector = CommentsCollector(
+        api,
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=2,
+        max_replies_per_content=10,
+        bounded_browser_fallback_parent_limit=3,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", tmp_path / "out.json", attempt_timeout_seconds=1.0
+    )
+
+    assert api.reply_parent_ids == [
+        "root-0",
+        "root-1",
+        "root-2",
+        "root-3",
+        "root-4",
+    ]
+    assert payload["reply_api_attempted"] == 5
+    assert payload["reply_api_failed"] == 5
+    assert payload["reply_browser_fallback_attempted"] == 0
 
 
 @pytest.mark.asyncio

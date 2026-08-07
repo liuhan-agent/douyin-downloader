@@ -41,6 +41,21 @@ _SAFE_REPLY_ERROR_CODES = {
 }
 
 
+def _bounded_reply_phase_budgets(
+    total_seconds: float, browser_cap_seconds: float
+) -> Tuple[float, float]:
+    """Split remaining attempt time while preserving fallback and save time."""
+    total = max(0.0, float(total_seconds))
+    browser_cap = max(0.0, float(browser_cap_seconds))
+    if total <= 0:
+        return 0.0, 0.0
+
+    finalization_margin = min(1.0, max(0.01, total * 0.1))
+    usable = max(0.0, total - finalization_margin)
+    browser_budget = min(browser_cap, usable / 2.0)
+    return usable - browser_budget, browser_budget
+
+
 class CommentCheckpointError(RuntimeError):
     """Fixed safe error raised when an atomic checkpoint cannot be written."""
 
@@ -461,25 +476,43 @@ class CommentsCollector:
 
         attempt_budget = float(attempt_timeout_seconds)
         elapsed = asyncio.get_running_loop().time() - attempt_started_at
-        finalization_margin = min(1.0, max(0.01, attempt_budget * 0.2))
-        remaining = attempt_budget - elapsed - finalization_margin
+        remaining = attempt_budget - elapsed
         if remaining <= 0:
             self._record_reply_timeout()
             return
+        browser_parent_limit = (
+            self.bounded_browser_fallback_parent_limit
+            if self.reply_browser_fallback is not None
+            else None
+        )
+        browser_cap = (
+            self.bounded_browser_fallback_timeout_seconds
+            if browser_parent_limit is not None
+            else 0.0
+        )
+        api_budget, browser_budget = _bounded_reply_phase_budgets(
+            remaining, browser_cap
+        )
+        phase_budget = api_budget + browser_budget
+        if phase_budget <= 0:
+            self._record_reply_timeout()
+            return
+        scheduling_margin = min(
+            0.05, max(0.0, (remaining - phase_budget) / 2.0)
+        )
         try:
             await asyncio.wait_for(
                 self._collect_replies(
                     aweme_id,
                     comments,
                     allow_browser_fallback=True,
-                    browser_fallback_parent_limit=(
-                        self.bounded_browser_fallback_parent_limit
-                    ),
+                    browser_fallback_parent_limit=browser_parent_limit,
                     browser_fallback_timeout_seconds=(
-                        self.bounded_browser_fallback_timeout_seconds
+                        browser_budget
                     ),
+                    api_phase_timeout_seconds=api_budget,
                 ),
-                timeout=remaining,
+                timeout=phase_budget + scheduling_margin,
             )
         except asyncio.TimeoutError:
             self._record_reply_timeout()
@@ -492,10 +525,18 @@ class CommentsCollector:
         allow_browser_fallback: bool = True,
         browser_fallback_parent_limit: Optional[int] = None,
         browser_fallback_timeout_seconds: Optional[float] = None,
+        api_phase_timeout_seconds: Optional[float] = None,
     ) -> None:
         failed: List[Dict[str, Any]] = []
         content_reply_count = 0
         metrics = self._last_reply_metrics
+        loop = asyncio.get_running_loop()
+        api_deadline = (
+            loop.time() + max(0.0, api_phase_timeout_seconds)
+            if api_phase_timeout_seconds is not None
+            else None
+        )
+        api_phase_stopped = False
 
         for comment in list(comments):
             if content_reply_count >= self.max_replies_per_content:
@@ -532,13 +573,40 @@ class CommentsCollector:
                 metrics["replies_truncated"] = True
                 continue
 
+            if api_phase_stopped:
+                metrics["replies_truncated"] = True
+                continue
+            if (
+                browser_fallback_parent_limit is not None
+                and len(failed) >= browser_fallback_parent_limit
+            ):
+                api_phase_stopped = True
+                metrics["replies_truncated"] = True
+                continue
+
+            api_remaining = (
+                api_deadline - loop.time() if api_deadline is not None else None
+            )
+            if api_remaining is not None and api_remaining <= 0:
+                api_phase_stopped = True
+                metrics["replies_truncated"] = True
+                continue
+
             metrics["reply_api_attempted"] += 1
             remaining = self.max_replies_per_content - content_reply_count
-            replies, error_code, truncated = await self._collect_reply_pages(
-                aweme_id,
-                parent_id,
-                min(self.max_replies_per_comment, remaining),
-            )
+            try:
+                collect_replies = self._collect_reply_pages(
+                    aweme_id,
+                    parent_id,
+                    min(self.max_replies_per_comment, remaining),
+                )
+                replies, error_code, truncated = (
+                    await asyncio.wait_for(collect_replies, timeout=api_remaining)
+                    if api_remaining is not None
+                    else await collect_replies
+                )
+            except asyncio.TimeoutError:
+                replies, error_code, truncated = [], "reply_timeout", True
             metrics["replies_truncated"] = metrics["replies_truncated"] or truncated
             if error_code:
                 metrics["reply_api_failed"] += 1
@@ -549,6 +617,11 @@ class CommentsCollector:
                         "error_code": error_code,
                     }
                 )
+                if (
+                    browser_fallback_parent_limit is not None
+                    and len(failed) >= browser_fallback_parent_limit
+                ):
+                    api_phase_stopped = True
             else:
                 metrics["reply_api_succeeded"] += 1
             parent_remaining = max(
