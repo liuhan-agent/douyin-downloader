@@ -37,6 +37,9 @@ _SENSITIVE_KEY_PARTS = (
     "traceback",
 )
 _ALLOWED_STATE_KEYS = frozenset({"status_code", "has_more", "cursor", "max_cursor"})
+_ALLOWED_PRE_JSON_OUTCOMES = frozenset(
+    {"empty", "non_json", "transport_error", "http_error"}
+)
 
 
 def _json_type(value: object) -> str:
@@ -154,31 +157,52 @@ class ReplyResponseStructureRecorder:
     async def capture(self, payload: object) -> bool:
         try:
             structure = build_reply_response_structure(payload)
-            async with self._lock:
-                self._capture_count += 1
-                fingerprint = structure["fingerprint"]
-                existing = next(
-                    (
-                        item
-                        for item in self._structures
-                        if item.get("fingerprint") == fingerprint
-                    ),
-                    None,
-                )
-                if existing is not None:
-                    existing["occurrence_count"] += 1
-                elif len(self._structures) < MAX_STRUCTURES:
-                    sample = dict(structure)
-                    sample.pop("schema_version", None)
-                    sample["occurrence_count"] = 1
-                    self._structures.append(sample)
-                else:
-                    self._dropped_structure_count += 1
-                await self._write()
-            return True
+            return await self._capture_structure(structure)
         except Exception:  # noqa: BLE001 - diagnostics must never break collection
             logger.error("Reply response structure capture failed")
             return False
+
+    async def capture_outcome(self, outcome: str) -> bool:
+        safe_outcome = (
+            outcome if outcome in _ALLOWED_PRE_JSON_OUTCOMES else "unknown"
+        )
+        canonical = json.dumps({"root_type": safe_outcome}, separators=(",", ":"))
+        structure = {
+            "schema_version": SCHEMA_VERSION,
+            "root_type": safe_outcome,
+            "fields": [],
+            "allowed_state": {},
+            "fingerprint": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        }
+        try:
+            return await self._capture_structure(structure)
+        except Exception:  # noqa: BLE001 - diagnostics must never break collection
+            logger.error("Reply response structure capture failed")
+            return False
+
+    async def _capture_structure(self, structure: Dict[str, Any]) -> bool:
+        async with self._lock:
+            self._capture_count += 1
+            fingerprint = structure["fingerprint"]
+            existing = next(
+                (
+                    item
+                    for item in self._structures
+                    if item.get("fingerprint") == fingerprint
+                ),
+                None,
+            )
+            if existing is not None:
+                existing["occurrence_count"] += 1
+            elif len(self._structures) < MAX_STRUCTURES:
+                sample = dict(structure)
+                sample.pop("schema_version", None)
+                sample["occurrence_count"] = 1
+                self._structures.append(sample)
+            else:
+                self._dropped_structure_count += 1
+            await self._write()
+        return True
 
     def _artifact(self) -> Dict[str, Any]:
         return {

@@ -196,3 +196,19 @@ async def test_recorder_failure_never_emits_exception_or_response_values(
     combined = captured.out + captured.err
     assert secret not in combined
     assert response_secret not in combined
+
+
+async def test_recorder_persists_only_allowlisted_pre_json_outcomes(tmp_path):
+    destination = tmp_path / "reply-response-structure.json"
+    recorder = ReplyResponseStructureRecorder(destination)
+
+    await recorder.capture_outcome("transport_error")
+    await recorder.capture_outcome("transport_error")
+    await recorder.capture_outcome("non_json")
+    await recorder.capture_outcome("SECRET_UNSAFE_OUTCOME")
+
+    artifact = json.loads(destination.read_text(encoding="utf-8"))
+    by_type = {item["root_type"]: item for item in artifact["structures"]}
+    assert set(by_type) == {"transport_error", "non_json", "unknown"}
+    assert by_type["transport_error"]["occurrence_count"] == 2
+    assert "SECRET_UNSAFE_OUTCOME" not in destination.read_text(encoding="utf-8")

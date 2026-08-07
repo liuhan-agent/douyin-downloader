@@ -317,6 +317,22 @@ class DouyinAPIClient:
             else None
         )
 
+    async def _capture_reply_response_structure(self, payload: object) -> None:
+        if not self._reply_response_structure_recorder:
+            return
+        try:
+            await self._reply_response_structure_recorder.capture(payload)
+        except Exception:  # noqa: BLE001 - optional diagnostics only
+            logger.error("Reply response structure capture failed")
+
+    async def _capture_reply_response_outcome(self, outcome: str) -> None:
+        if not self._reply_response_structure_recorder:
+            return
+        try:
+            await self._reply_response_structure_recorder.capture_outcome(outcome)
+        except Exception:  # noqa: BLE001 - optional diagnostics only
+            logger.error("Reply response structure capture failed")
+
     async def _ensure_ms_token(self) -> str:
         if self._ms_token:
             return self._ms_token
@@ -442,6 +458,8 @@ class DouyinAPIClient:
                     if response.status == 200:
                         body = await response.read()
                         if not body:
+                            if is_reply_response:
+                                await self._capture_reply_response_outcome("empty")
                             # Empty 200 response is a common anti-bot signal
                             # from Douyin. Retry with a fresh signature.
                             retry_status = (
@@ -470,6 +488,8 @@ class DouyinAPIClient:
                             try:
                                 data = _json.loads(body)
                             except Exception:
+                                if is_reply_response:
+                                    await self._capture_reply_response_outcome("non_json")
                                 logger.warning(
                                     "Non-JSON 200 response for %s, length=%d duration_ms=%d",
                                     path,
@@ -478,10 +498,7 @@ class DouyinAPIClient:
                                 )
                                 return {}
                         if is_reply_response and self._reply_response_structure_recorder:
-                            try:
-                                await self._reply_response_structure_recorder.capture(data)
-                            except Exception:  # noqa: BLE001 - optional diagnostics only
-                                logger.error("Reply response structure capture failed")
+                            await self._capture_reply_response_structure(data)
                         result = data if isinstance(data, dict) else {}
                         _log_api_response(
                             path,
@@ -499,6 +516,8 @@ class DouyinAPIClient:
                                 path,
                             )
                         return result
+                    if is_reply_response:
+                        await self._capture_reply_response_outcome("http_error")
                     if response.status < 500 and response.status != 429:
                         log_fn = logger.info if suppress_error else logger.error
                         log_fn(
@@ -529,6 +548,8 @@ class DouyinAPIClient:
             except (LoginRequiredError, APIRequestExhaustedError):
                 raise
             except Exception as exc:
+                if is_reply_response:
+                    await self._capture_reply_response_outcome("transport_error")
                 last_exc = exc
                 logger.warning(
                     "Douyin API attempt failed: path=%s attempt=%d/%d duration_ms=%d "

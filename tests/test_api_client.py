@@ -694,6 +694,30 @@ class _JSONSequenceSession:
         self.closed = True
 
 
+class _NonJSONResponse(_JSONResponse):
+    def __init__(self, body):
+        self.body = body
+
+    async def read(self):
+        return self.body
+
+    async def json(self, **_kwargs):
+        raise ValueError("not json")
+
+
+class _NonJSONSession:
+    closed = False
+
+    def __init__(self, body):
+        self.body = body
+
+    def get(self, *_args, **_kwargs):
+        return _NonJSONResponse(self.body)
+
+    async def close(self):
+        self.closed = True
+
+
 @pytest.mark.asyncio
 async def test_reply_request_captures_original_json_root_before_dict_coercion(tmp_path):
     destination = tmp_path / "reply-response-structure.json"
@@ -764,6 +788,43 @@ async def test_reply_capture_failure_does_not_change_response_or_expose_exceptio
     captured = capsys.readouterr()
     combined = caplog.text + captured.out + captured.err
     assert result == {"status_code": 0, "comments": []}
+    assert secret not in combined
+
+
+@pytest.mark.asyncio
+async def test_reply_transport_failure_records_only_safe_outcome(tmp_path):
+    destination = tmp_path / "reply-response-structure.json"
+    client = DouyinAPIClient({"msToken": "token-1"})
+    client._session = _TimeoutSession()
+    client.configure_reply_response_structure_capture(destination)
+
+    result = await client._request_json(
+        "/aweme/v1/web/comment/list/reply/", {}, max_retries=1
+    )
+
+    artifact = json.loads(destination.read_text(encoding="utf-8"))
+    assert result == {}
+    assert artifact["capture_count"] == 1
+    assert artifact["structures"][0]["root_type"] == "transport_error"
+
+
+@pytest.mark.asyncio
+async def test_reply_non_json_body_records_type_without_body(tmp_path, caplog, capsys):
+    secret = "HTML_BODY_SECRET_f4ea71"
+    destination = tmp_path / "reply-response-structure.json"
+    client = DouyinAPIClient({"msToken": "token-1"})
+    client._session = _NonJSONSession(f"<html>{secret}</html>".encode("utf-8"))
+    client.configure_reply_response_structure_capture(destination)
+
+    result = await client._request_json(
+        "/aweme/v1/web/comment/list/reply/", {}, max_retries=1
+    )
+
+    captured = capsys.readouterr()
+    artifact_text = destination.read_text(encoding="utf-8")
+    combined = caplog.text + captured.out + captured.err + artifact_text
+    assert result == {}
+    assert json.loads(artifact_text)["structures"][0]["root_type"] == "non_json"
     assert secret not in combined
 
 
