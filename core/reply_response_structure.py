@@ -152,8 +152,8 @@ class ReplyResponseStructureRecorder:
         self._structures: List[Dict[str, Any]] = []
 
     async def capture(self, payload: object) -> bool:
-        structure = build_reply_response_structure(payload)
         try:
+            structure = build_reply_response_structure(payload)
             async with self._lock:
                 self._capture_count += 1
                 fingerprint = structure["fingerprint"]

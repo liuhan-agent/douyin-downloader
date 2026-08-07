@@ -662,6 +662,111 @@ class _SensitiveFailureSession:
         self.closed = True
 
 
+class _JSONResponse:
+    status = 200
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return False
+
+    async def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+    async def json(self, **_kwargs):
+        return self.payload
+
+
+class _JSONSequenceSession:
+    closed = False
+
+    def __init__(self, *payloads):
+        self.payloads = list(payloads)
+
+    def get(self, *_args, **_kwargs):
+        return _JSONResponse(self.payloads.pop(0))
+
+    async def close(self):
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_reply_request_captures_original_json_root_before_dict_coercion(tmp_path):
+    destination = tmp_path / "reply-response-structure.json"
+    client = DouyinAPIClient({"msToken": "token-1"})
+    client._session = _JSONSequenceSession([], {"status_code": 0, "comments": []})
+    client.configure_reply_response_structure_capture(destination)
+
+    first = await client._request_json(
+        "/aweme/v1/web/comment/list/reply/", {}, max_retries=1
+    )
+    second = await client._request_json(
+        "/aweme/v1/web/comment/list/reply/", {}, max_retries=1
+    )
+
+    artifact = json.loads(destination.read_text(encoding="utf-8"))
+    assert first == {}
+    assert second == {"status_code": 0, "comments": []}
+    assert artifact["capture_count"] == 2
+    assert {item["root_type"] for item in artifact["structures"]} == {"list", "object"}
+
+
+@pytest.mark.asyncio
+async def test_reply_login_response_never_exposes_status_message(
+    tmp_path, caplog, capsys
+):
+    secret = "STATUS_MESSAGE_SECRET_26d70c"
+    destination = tmp_path / "reply-response-structure.json"
+    client = DouyinAPIClient({"msToken": "token-1"})
+    client._session = _JSONSequenceSession(
+        {"status_code": 2483, "status_msg": f"login required {secret}", "comments": []}
+    )
+    client.configure_reply_response_structure_capture(destination)
+
+    with pytest.raises(ReplyAPIError) as exc_info:
+        await client.get_aweme_comment_replies(aweme_id="A1", comment_id="C1")
+
+    captured = capsys.readouterr()
+    combined = (
+        str(exc_info.value)
+        + caplog.text
+        + captured.out
+        + captured.err
+        + destination.read_text(encoding="utf-8")
+    )
+    assert exc_info.value.error_code == "reply_login_required"
+    assert secret not in combined
+    assert "msToken" not in combined
+
+
+@pytest.mark.asyncio
+async def test_reply_capture_failure_does_not_change_response_or_expose_exception(
+    caplog, capsys
+):
+    secret = "CAPTURE_EXCEPTION_SECRET_37370b"
+
+    class _FailingRecorder:
+        async def capture(self, _payload):
+            raise RuntimeError(secret)
+
+    client = DouyinAPIClient({"msToken": "token-1"})
+    client._session = _JSONSequenceSession({"status_code": 0, "comments": []})
+    client._reply_response_structure_recorder = _FailingRecorder()
+
+    result = await client._request_json(
+        "/aweme/v1/web/comment/list/reply/", {}, max_retries=1
+    )
+
+    captured = capsys.readouterr()
+    combined = caplog.text + captured.out + captured.err
+    assert result == {"status_code": 0, "comments": []}
+    assert secret not in combined
+
+
 @pytest.mark.asyncio
 async def test_request_json_strict_timeout_raises_safe_error():
     client = DouyinAPIClient({"msToken": "token-1"})
