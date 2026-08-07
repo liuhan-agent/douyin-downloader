@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, List, Optional, Tuple
@@ -136,6 +137,8 @@ class CommentsCollector:
         max_replies_per_comment: int = 20,
         max_replies_per_content: int = 200,
         reply_browser_fallback: Optional[ReplyBrowserFallback] = None,
+        bounded_browser_fallback_parent_limit: int = 3,
+        bounded_browser_fallback_timeout_seconds: float = 20.0,
         content_url_resolver: Optional[Callable[[str], Optional[str]]] = None,
     ):
         self.api_client = api_client
@@ -147,6 +150,13 @@ class CommentsCollector:
         self.max_replies_per_comment = max(0, int(max_replies_per_comment or 0))
         self.max_replies_per_content = max(0, int(max_replies_per_content or 0))
         self.reply_browser_fallback = reply_browser_fallback
+        self.bounded_browser_fallback_parent_limit = max(
+            1, int(bounded_browser_fallback_parent_limit or 3)
+        )
+        bounded_timeout = float(bounded_browser_fallback_timeout_seconds or 20.0)
+        self.bounded_browser_fallback_timeout_seconds = (
+            bounded_timeout if math.isfinite(bounded_timeout) and bounded_timeout > 0 else 20.0
+        )
         self.content_url_resolver = content_url_resolver
         self._content_urls: Dict[str, str] = {}
         self._last_reply_metrics: Dict[str, Any] = {}
@@ -461,7 +471,13 @@ class CommentsCollector:
                 self._collect_replies(
                     aweme_id,
                     comments,
-                    allow_browser_fallback=False,
+                    allow_browser_fallback=True,
+                    browser_fallback_parent_limit=(
+                        self.bounded_browser_fallback_parent_limit
+                    ),
+                    browser_fallback_timeout_seconds=(
+                        self.bounded_browser_fallback_timeout_seconds
+                    ),
                 ),
                 timeout=remaining,
             )
@@ -474,6 +490,8 @@ class CommentsCollector:
         comments: List[Dict[str, Any]],
         *,
         allow_browser_fallback: bool = True,
+        browser_fallback_parent_limit: Optional[int] = None,
+        browser_fallback_timeout_seconds: Optional[float] = None,
     ) -> None:
         failed: List[Dict[str, Any]] = []
         content_reply_count = 0
@@ -550,23 +568,59 @@ class CommentsCollector:
             self._record_failures(failed, fallback=False)
             return
 
+        if (
+            browser_fallback_parent_limit is not None
+            and len(failed) > browser_fallback_parent_limit
+        ):
+            self._record_failures(
+                failed[browser_fallback_parent_limit:], fallback=False
+            )
+            failed = failed[:browser_fallback_parent_limit]
+            metrics["replies_truncated"] = True
+
         metrics["reply_browser_fallback_attempted"] += len(failed)
         try:
-            result = await self.reply_browser_fallback(
+            fallback = self.reply_browser_fallback(
                 aweme_id,
                 self._content_url(aweme_id),
                 failed,
                 self.max_replies_per_comment,
                 max(0, self.max_replies_per_content - content_reply_count),
             )
+            result = (
+                await asyncio.wait_for(
+                    fallback, timeout=browser_fallback_timeout_seconds
+                )
+                if browser_fallback_timeout_seconds is not None
+                else await fallback
+            )
+        except asyncio.CancelledError:
+            metrics["reply_browser_fallback_failed"] += len(failed)
+            self._record_failures(
+                [{"error_code": "reply_timeout"} for _ in failed],
+                fallback=True,
+            )
+            raise
         except asyncio.TimeoutError:
-            result = {"failures": [{"error_code": "reply_timeout"}]}
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Browser reply fallback failed for %s: %s", aweme_id, exc)
-            result = {"failures": [{"error_code": "reply_browser_failed"}]}
+            result = {
+                "failures": [
+                    {"error_code": "reply_timeout"} for _ in failed
+                ]
+            }
+        except Exception:  # noqa: BLE001
+            logger.warning("Browser reply fallback failed")
+            result = {
+                "failures": [
+                    {"error_code": "reply_browser_failed"} for _ in failed
+                ]
+            }
 
         if not isinstance(result, dict):
-            result = {"failures": [{"error_code": "reply_browser_failed"}]}
+            result = {
+                "failures": [
+                    {"error_code": "reply_browser_failed"} for _ in failed
+                ]
+            }
         metrics["replies_truncated"] = metrics["replies_truncated"] or bool(
             result.get("truncated")
         )
@@ -627,21 +681,29 @@ class CommentsCollector:
             succeeded_parents.add(parent_id)
             added += 1
         content_reply_count += added
-        if added:
-            metrics["reply_browser_fallback_succeeded"] += len(succeeded_parents)
+        succeeded_count = len(succeeded_parents)
+        metrics["reply_browser_fallback_succeeded"] += succeeded_count
 
         result_failures = result.get("failures") or []
         if not isinstance(result_failures, list):
             result_failures = []
-        if result_failures:
-            metrics["reply_browser_fallback_failed"] += len(failed)
-            self._record_failures(result_failures, fallback=True)
-        elif not added:
-            metrics["reply_browser_fallback_failed"] += len(failed)
-            self._record_failures(
-                [{"error_code": "reply_browser_failed"} for _ in failed],
-                fallback=True,
+        failed_count = max(0, len(failed) - succeeded_count)
+        if failed_count:
+            normalized_failures = [
+                {
+                    "error_code": _safe_error_code(
+                        item.get("error_code") if isinstance(item, dict) else None,
+                        "reply_browser_failed",
+                    )
+                }
+                for item in result_failures[:failed_count]
+            ]
+            normalized_failures.extend(
+                {"error_code": "reply_browser_failed"}
+                for _ in range(failed_count - len(normalized_failures))
             )
+            metrics["reply_browser_fallback_failed"] += failed_count
+            self._record_failures(normalized_failures, fallback=True)
 
     async def _collect_reply_pages(
         self, aweme_id: str, parent_id: str, limit: int
@@ -732,6 +794,7 @@ class CommentsCollector:
                 failure.get("error_code"),
                 "reply_browser_failed",
             )
+            metrics["replies_truncated"] = True
             metrics["reply_failures"].append({"error_code": code})
             if fallback:
                 counts = metrics["reply_fallback_failure_counts"]

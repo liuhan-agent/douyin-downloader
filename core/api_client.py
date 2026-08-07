@@ -6,12 +6,14 @@ import os
 import random
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 
 import aiohttp
 
 from auth import MsTokenManager
+from core.reply_response_structure import ReplyResponseStructureRecorder
 from utils.cookie_utils import sanitize_cookies
 from utils.logger import safe_log_url, setup_logger
 from utils.xbogus import XBogus
@@ -25,6 +27,7 @@ except Exception:  # pragma: no cover - optional dependency
 logger = setup_logger("APIClient")
 
 _LOGIN_REQUIRED_STATUS_CODES = {2483}
+_REPLY_RESPONSE_PATH = "/aweme/v1/web/comment/list/reply"
 
 
 class LoginRequiredError(Exception):
@@ -267,6 +270,9 @@ class DouyinAPIClient:
         self._ms_token_manager = MsTokenManager(user_agent=self.headers["User-Agent"])
         self._ms_token = (self.cookies.get("msToken") or "").strip()
         self._abogus_enabled = ABogus is not None and BrowserFingerprintGenerator is not None
+        self._reply_response_structure_recorder: Optional[
+            ReplyResponseStructureRecorder
+        ] = None
 
     async def __aenter__(self) -> "DouyinAPIClient":
         await self._ensure_session()
@@ -299,6 +305,33 @@ class DouyinAPIClient:
         if self._session is None:
             raise RuntimeError("Failed to create aiohttp session")
         return self._session
+
+    def configure_reply_response_structure_capture(
+        self, destination: Optional[Path]
+    ) -> None:
+        """Set a per-run, value-free reply response structure destination."""
+
+        self._reply_response_structure_recorder = (
+            ReplyResponseStructureRecorder(Path(destination))
+            if destination is not None
+            else None
+        )
+
+    async def _capture_reply_response_structure(self, payload: object) -> None:
+        if not self._reply_response_structure_recorder:
+            return
+        try:
+            await self._reply_response_structure_recorder.capture(payload)
+        except Exception:  # noqa: BLE001 - optional diagnostics only
+            logger.error("Reply response structure capture failed")
+
+    async def _capture_reply_response_outcome(self, outcome: str) -> None:
+        if not self._reply_response_structure_recorder:
+            return
+        try:
+            await self._reply_response_structure_recorder.capture_outcome(outcome)
+        except Exception:  # noqa: BLE001 - optional diagnostics only
+            logger.error("Reply response structure capture failed")
 
     async def _ensure_ms_token(self) -> str:
         if self._ms_token:
@@ -399,6 +432,7 @@ class DouyinAPIClient:
 
         for attempt in range(max_retries):
             started = time.monotonic()
+            is_reply_response = path.rstrip("/") == _REPLY_RESPONSE_PATH
             if base_url:
                 signed_url, ua = self.build_signed_path(path, params, base_url=base_url)
             else:
@@ -413,7 +447,7 @@ class DouyinAPIClient:
                 signer,
                 bool(self.proxy),
                 "custom" if base_url else "default",
-                ",".join(sorted(str(key) for key in params)),
+                "" if is_reply_response else ",".join(sorted(str(key) for key in params)),
             )
             try:
                 async with self._session.get(
@@ -424,6 +458,8 @@ class DouyinAPIClient:
                     if response.status == 200:
                         body = await response.read()
                         if not body:
+                            if is_reply_response:
+                                await self._capture_reply_response_outcome("empty")
                             # Empty 200 response is a common anti-bot signal
                             # from Douyin. Retry with a fresh signature.
                             retry_status = (
@@ -452,6 +488,8 @@ class DouyinAPIClient:
                             try:
                                 data = _json.loads(body)
                             except Exception:
+                                if is_reply_response:
+                                    await self._capture_reply_response_outcome("non_json")
                                 logger.warning(
                                     "Non-JSON 200 response for %s, length=%d duration_ms=%d",
                                     path,
@@ -459,6 +497,8 @@ class DouyinAPIClient:
                                     _elapsed_ms(started),
                                 )
                                 return {}
+                        if is_reply_response and self._reply_response_structure_recorder:
+                            await self._capture_reply_response_structure(data)
                         result = data if isinstance(data, dict) else {}
                         _log_api_response(
                             path,
@@ -467,7 +507,7 @@ class DouyinAPIClient:
                             body,
                             result,
                             started,
-                            redact_values=raise_on_exhausted,
+                            redact_values=raise_on_exhausted or is_reply_response,
                         )
                         if _is_login_required(result):
                             raise LoginRequiredError(
@@ -476,6 +516,8 @@ class DouyinAPIClient:
                                 path,
                             )
                         return result
+                    if is_reply_response:
+                        await self._capture_reply_response_outcome("http_error")
                     if response.status < 500 and response.status != 429:
                         log_fn = logger.info if suppress_error else logger.error
                         log_fn(
@@ -506,6 +548,8 @@ class DouyinAPIClient:
             except (LoginRequiredError, APIRequestExhaustedError):
                 raise
             except Exception as exc:
+                if is_reply_response:
+                    await self._capture_reply_response_outcome("transport_error")
                 last_exc = exc
                 logger.warning(
                     "Douyin API attempt failed: path=%s attempt=%d/%d duration_ms=%d "
@@ -514,9 +558,11 @@ class DouyinAPIClient:
                     attempt + 1,
                     max_retries,
                     _elapsed_ms(started),
-                    type(exc).__name__,
+                    "-" if is_reply_response else type(exc).__name__,
                     (
-                        _safe_request_error_code(exc, saw_empty_response)
+                        "reply_api_failed"
+                        if is_reply_response
+                        else _safe_request_error_code(exc, saw_empty_response)
                         if raise_on_exhausted
                         else _safe_error_text(exc)
                     ),
@@ -540,9 +586,15 @@ class DouyinAPIClient:
             path,
             max_retries,
             suppress_error,
-            type(last_exc).__name__ if last_exc else "-",
             (
-                _safe_request_error_code(last_exc, saw_empty_response)
+                "-"
+                if is_reply_response
+                else (type(last_exc).__name__ if last_exc else "-")
+            ),
+            (
+                "reply_api_failed"
+                if is_reply_response
+                else _safe_request_error_code(last_exc, saw_empty_response)
                 if raise_on_exhausted
                 else (_safe_error_text(last_exc) if last_exc else "-")
             ),
@@ -1263,7 +1315,7 @@ class DouyinAPIClient:
         try:
             raw = await self._request_json("/aweme/v1/web/comment/list/reply/", params)
         except LoginRequiredError as exc:
-            raise ReplyAPIError("reply_login_required", str(exc)) from exc
+            raise ReplyAPIError("reply_login_required", "login required") from exc
         except asyncio.TimeoutError as exc:
             raise ReplyAPIError("reply_timeout", "reply request timed out") from exc
         except ReplyAPIError:

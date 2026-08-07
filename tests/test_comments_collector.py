@@ -541,7 +541,7 @@ async def test_collector_uses_browser_fallback_after_reply_api_failure(tmp_path)
 
 
 @pytest.mark.asyncio
-async def test_bounded_reply_attempt_skips_browser_fallback(tmp_path):
+async def test_bounded_reply_attempt_uses_limited_browser_fallback(tmp_path):
     class _ReplyFailure(RuntimeError):
         error_code = "reply_response_invalid"
 
@@ -559,18 +559,276 @@ async def test_bounded_reply_attempt_skips_browser_fallback(tmp_path):
         max_replies_per_comment=20,
         max_replies_per_content=200,
         reply_browser_fallback=_fallback,
+        bounded_browser_fallback_parent_limit=3,
+        bounded_browser_fallback_timeout_seconds=0.05,
     )
 
     payload = await collector.collect_and_save(
         "A1", tmp_path / "out.json", attempt_timeout_seconds=1.0
     )
 
-    assert fallback_calls == []
-    assert [item["cid"] for item in payload["comments"]] == ["root-1"]
-    assert payload["reply_browser_fallback_attempted"] == 0
-    assert payload["reply_failures"] == [
-        {"error_code": "reply_response_invalid"}
+    assert len(fallback_calls) == 1
+    assert [item["comment_id"] for item in fallback_calls[0][2]] == ["root-1"]
+    assert [item["cid"] for item in payload["comments"]] == ["root-1", "reply-1"]
+    assert payload["comments"][-1]["parent_comment_id"] == "root-1"
+    assert payload["reply_browser_fallback_attempted"] == 1
+    assert payload["reply_browser_fallback_succeeded"] == 1
+    assert payload["reply_browser_fallback_failed"] == 0
+    assert payload["reply_failures"] == []
+
+
+@pytest.mark.asyncio
+async def test_bounded_browser_timeout_preserves_embedded_reply_and_atomic_partial(
+    tmp_path,
+):
+    class _ReplyFailure(RuntimeError):
+        error_code = "reply_response_invalid"
+
+    api = _EmbeddedReplyAPIClient(reply_total=2)
+    api.reply_error = _ReplyFailure("empty")
+    fallback_calls = []
+
+    async def _fallback(*args):
+        fallback_calls.append(args)
+        await asyncio.Event().wait()
+
+    output = tmp_path / "out.json"
+    collector = CommentsCollector(
+        api,
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+        reply_browser_fallback=_fallback,
+        bounded_browser_fallback_parent_limit=3,
+        bounded_browser_fallback_timeout_seconds=0.01,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", output, attempt_timeout_seconds=1.0
+    )
+
+    assert len(fallback_calls) == 1
+    assert [item["cid"] for item in payload["comments"]] == [
+        "root-1",
+        "reply-embedded",
     ]
+    assert payload["reply_browser_fallback_attempted"] == 1
+    assert payload["reply_browser_fallback_succeeded"] == 0
+    assert payload["reply_browser_fallback_failed"] == 1
+    assert payload["reply_failures"] == [{"error_code": "reply_timeout"}]
+    assert payload["reply_fallback_failure_counts"] == {"reply_timeout": 1}
+    assert payload["replies_truncated"] is True
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
+
+
+@pytest.mark.asyncio
+async def test_bounded_browser_fallback_caps_and_allowlists_failed_parents(tmp_path):
+    class _ReplyFailure(RuntimeError):
+        error_code = "reply_response_invalid"
+
+    class _FiveParentAPI:
+        async def get_aweme_comments(
+            self, aweme_id, *, cursor, count, include_replies
+        ):
+            return {
+                "items": [
+                    {"cid": f"root-{index}", "reply_comment_total": 1}
+                    for index in range(5)
+                ],
+                "has_more": False,
+                "max_cursor": 0,
+            }
+
+        async def get_aweme_comment_replies(self, **_kwargs):
+            raise _ReplyFailure("empty")
+
+    fallback_calls = []
+
+    async def _fallback(*args):
+        fallback_calls.append(args)
+        return {
+            "replies": [
+                {"cid": f"reply-{index}", "parent_comment_id": f"root-{index}"}
+                for index in range(3)
+            ]
+            + [{"cid": "outside-reply", "parent_comment_id": "root-4"}]
+        }
+
+    collector = CommentsCollector(
+        _FiveParentAPI(),
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=2,
+        max_replies_per_content=10,
+        reply_browser_fallback=_fallback,
+        bounded_browser_fallback_parent_limit=3,
+        bounded_browser_fallback_timeout_seconds=0.05,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", tmp_path / "out.json", attempt_timeout_seconds=1.0
+    )
+
+    assert len(fallback_calls) == 1
+    assert [item["comment_id"] for item in fallback_calls[0][2]] == [
+        "root-0",
+        "root-1",
+        "root-2",
+    ]
+    replies = [item for item in payload["comments"] if item["parent_comment_id"]]
+    assert {item["cid"] for item in replies} == {"reply-0", "reply-1", "reply-2"}
+    assert {item["parent_comment_id"] for item in replies} == {
+        "root-0",
+        "root-1",
+        "root-2",
+    }
+    assert payload["reply_api_attempted"] == 5
+    assert payload["reply_api_failed"] == 5
+    assert payload["reply_browser_fallback_attempted"] == 3
+    assert payload["reply_browser_fallback_succeeded"] == 3
+    assert payload["reply_browser_fallback_failed"] == 0
+    assert payload["reply_failures"] == [
+        {"error_code": "reply_response_invalid"},
+        {"error_code": "reply_response_invalid"},
+    ]
+    assert payload["replies_truncated"] is True
+
+
+@pytest.mark.asyncio
+async def test_browser_fallback_counts_only_unrecovered_selected_parents(tmp_path):
+    class _ReplyFailure(RuntimeError):
+        error_code = "reply_response_invalid"
+
+    class _ThreeParentAPI:
+        async def get_aweme_comments(
+            self, aweme_id, *, cursor, count, include_replies
+        ):
+            return {
+                "items": [
+                    {"cid": f"root-{index}", "reply_comment_total": 1}
+                    for index in range(3)
+                ],
+                "has_more": False,
+                "max_cursor": 0,
+            }
+
+        async def get_aweme_comment_replies(self, **_kwargs):
+            raise _ReplyFailure("empty")
+
+    async def _fallback(*_args):
+        return {
+            "replies": [{"cid": "reply-0", "parent_comment_id": "root-0"}],
+            "failures": [{"error_code": "reply_timeout"}],
+        }
+
+    collector = CommentsCollector(
+        _ThreeParentAPI(),
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=2,
+        max_replies_per_content=10,
+        reply_browser_fallback=_fallback,
+        bounded_browser_fallback_parent_limit=3,
+        bounded_browser_fallback_timeout_seconds=0.05,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", tmp_path / "out.json", attempt_timeout_seconds=1.0
+    )
+
+    assert payload["reply_browser_fallback_attempted"] == 3
+    assert payload["reply_browser_fallback_succeeded"] == 1
+    assert payload["reply_browser_fallback_failed"] == 2
+    assert payload["reply_failures"] == [
+        {"error_code": "reply_timeout"},
+        {"error_code": "reply_browser_failed"},
+    ]
+    assert payload["reply_fallback_failure_counts"] == {
+        "reply_browser_failed": 1,
+        "reply_timeout": 1,
+    }
+
+
+@pytest.mark.asyncio
+async def test_browser_fallback_exception_is_sanitized_in_output_and_logs(
+    tmp_path, caplog, capsys
+):
+    class _ReplyFailure(RuntimeError):
+        error_code = "reply_response_invalid"
+
+    secret = "COOKIE_TOKEN_PATH_SECRET_61ac86"
+    api = _ReplyAPIClient(reply_error=_ReplyFailure("empty"))
+
+    async def _fallback(*_args):
+        raise RuntimeError(secret)
+
+    output = tmp_path / "out.json"
+    collector = CommentsCollector(
+        api,
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+        reply_browser_fallback=_fallback,
+        bounded_browser_fallback_parent_limit=3,
+        bounded_browser_fallback_timeout_seconds=0.05,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", output, attempt_timeout_seconds=1.0
+    )
+
+    captured = capsys.readouterr()
+    combined = (
+        json.dumps(payload, ensure_ascii=False)
+        + output.read_text(encoding="utf-8")
+        + caplog.text
+        + captured.out
+        + captured.err
+    )
+    assert secret not in combined
+    assert payload["reply_browser_fallback_attempted"] == 1
+    assert payload["reply_browser_fallback_succeeded"] == 0
+    assert payload["reply_browser_fallback_failed"] == 1
+    assert payload["reply_failures"] == [{"error_code": "reply_browser_failed"}]
+    assert payload["reply_fallback_failure_counts"] == {"reply_browser_failed": 1}
+
+
+@pytest.mark.asyncio
+async def test_work_deadline_cancels_one_browser_call_and_saves_partial(tmp_path):
+    class _ReplyFailure(RuntimeError):
+        error_code = "reply_response_invalid"
+
+    calls = []
+
+    async def _fallback(*args):
+        calls.append(args)
+        await asyncio.Event().wait()
+
+    output = tmp_path / "out.json"
+    collector = CommentsCollector(
+        _ReplyAPIClient(reply_error=_ReplyFailure("empty")),
+        MetadataHandler(),
+        include_replies=True,
+        max_replies_per_comment=20,
+        max_replies_per_content=200,
+        reply_browser_fallback=_fallback,
+        bounded_browser_fallback_parent_limit=3,
+        bounded_browser_fallback_timeout_seconds=1.0,
+    )
+
+    payload = await collector.collect_and_save(
+        "A1", output, attempt_timeout_seconds=0.05
+    )
+
+    assert len(calls) == 1
+    assert payload["reply_browser_fallback_attempted"] == 1
+    assert payload["reply_browser_fallback_succeeded"] == 0
+    assert payload["reply_browser_fallback_failed"] == 1
+    assert payload["reply_failures"] == [{"error_code": "reply_timeout"}]
+    assert payload["reply_fallback_failure_counts"] == {"reply_timeout": 1}
+    assert json.loads(output.read_text(encoding="utf-8")) == payload
 
 
 @pytest.mark.asyncio
